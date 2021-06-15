@@ -2,7 +2,7 @@ defmodule ATECC508A.Transport.I2CServer do
   use GenServer
   require Logger
 
-  alias ATECC508A.Transport.Cache
+  alias ATECC508A.{Transport, Transport.Cache}
 
   @moduledoc false
 
@@ -10,6 +10,8 @@ defmodule ATECC508A.Transport.I2CServer do
   @atecc508a_wake_delay_ms 2
   @atecc508a_signature <<0x04, 0x11, 0x33, 0x43>>
   @atecc508a_poll_interval_ms 2
+  @atecc508a_retry_wakeup_ms 500
+  @atecc508a_default_wakeup_retries 4
 
   @spec start_link(keyword()) :: :ignore | {:error, any()} | {:ok, pid()}
   def start_link([bus_name, address, process_name]) do
@@ -31,6 +33,16 @@ defmodule ATECC508A.Transport.I2CServer do
           {:error, atom()} | {:ok, binary()}
   def request(server, payload, timeout, response_payload_len) do
     GenServer.call(server, {:request, payload, timeout, response_payload_len})
+  end
+
+  @doc """
+  Send a series of requests to the ATECC508A/608A
+  """
+  @spec request_all(GenServer.server(), [
+          {Transport.payload(), non_neg_integer(), non_neg_integer()}
+        ]) :: {:error, atom()} | {:ok, {[{:ok, binary()}], [{:error, atom()}]}}
+  def request_all(server, requests) do
+    GenServer.call(server, {:request_all, requests})
   end
 
   @doc """
@@ -74,20 +86,48 @@ defmodule ATECC508A.Transport.I2CServer do
 
   @impl true
   def handle_call({:request, payload, timeout, response_payload_len}, _from, state) do
-    case Cache.get(state.cache, payload) do
-      nil ->
-        case make_request(state, payload, timeout, response_payload_len) do
-          {:ok, _message} = rc ->
-            new_cache = Cache.put(state.cache, payload, rc)
-            {:reply, rc, %{state | cache: new_cache}}
+    ret =
+      with :ok <- wakeup(state.i2c, state.address),
+           {:ok, {message, new_cache}} <-
+             make_request(state, payload, timeout, response_payload_len) do
+        {:reply, {:ok, message}, %{state | cache: new_cache}}
+      else
+        error ->
+          {:reply, error, state}
+      end
 
-          error ->
-            {:reply, error, state}
-        end
+    # Always send a sleep after a request even if it fails so that the processor is in
+    # a known state for the next call.
+    _ = sleep(state.i2c, state.address)
+    ret
+  end
 
-      response ->
-        {:reply, response, state}
-    end
+  @impl true
+  def handle_call({:request_all, requests}, _from, state) do
+    ret =
+      with :ok <- wakeup(state.i2c, state.address) do
+        {oks, errors, new_cache} =
+          Enum.reduce(requests, {[], [], state.cache}, fn
+            {payload, timeout, response_payload_len}, {oks, errors, cache} ->
+              case make_request(state, payload, timeout, response_payload_len) do
+                {:ok, {message, new_cache}} ->
+                  {[{:ok, message} | oks], errors, new_cache}
+
+                error ->
+                  {oks, [error | errors], cache}
+              end
+          end)
+
+        {:reply, {:ok, {Enum.reverse(oks), Enum.reverse(errors)}}, %{state | cache: new_cache}}
+      else
+        error ->
+          {:reply, error, state}
+      end
+
+    # Always send a sleep after a request series even if it fails so that the processor is in a
+    # known state for the next call.
+    _ = sleep(state.i2c, state.address)
+    ret
   end
 
   @impl true
@@ -99,7 +139,7 @@ defmodule ATECC508A.Transport.I2CServer do
   @doc """
   Package up a request for transmission over I2C
   """
-  @spec package(binary()) :: iodata()
+  @spec package(binary()) :: iolist()
   def package(request) do
     len = byte_size(request) + 3
     crc = ATECC508A.CRC.crc(<<len, request::binary>>)
@@ -121,35 +161,35 @@ defmodule ATECC508A.Transport.I2CServer do
   end
 
   defp make_request(state, payload, timeout, response_payload_len) do
-    to_send = package(payload)
-    response_len = response_payload_len + 3
+    case Cache.get(state.cache, payload) do
+      nil ->
+        to_send = package(payload)
+        response_len = response_payload_len + 3
 
-    min_timeout = round(timeout / 2)
+        min_timeout = round(timeout / 2)
 
-    rc =
-      with :ok <- wakeup(state.i2c, state.address),
-           :ok <- Circuits.I2C.write(state.i2c, state.address, to_send),
-           Process.sleep(min_timeout),
-           {:ok, response} <-
-             poll_read(state.i2c, state.address, response_len, min_timeout, timeout) do
-        unpackage(response)
-      else
-        error ->
-          _ =
-            Logger.error(
-              "ATECC508A: Request failed: #{inspect(to_send, binaries: :as_binaries)}, #{timeout} ms -> #{
-                inspect(error)
-              }"
-            )
+        with :ok <- Circuits.I2C.write(state.i2c, state.address, to_send),
+             Process.sleep(min_timeout),
+             {:ok, response} <-
+               poll_read(state.i2c, state.address, response_len, min_timeout, timeout),
+             {:ok, response} <- unpackage(response) do
+          new_cache = Cache.put(state.cache, payload, response)
+          {:ok, {response, new_cache}}
+        else
+          error ->
+            _ =
+              Logger.error(
+                "ATECC508A: Request failed: #{inspect(to_send, binaries: :as_binaries)}, #{
+                  timeout
+                } ms -> #{inspect(error)}"
+              )
 
-          error
-      end
+            {:error, {error, state.cache}}
+        end
 
-    # Always send a sleep after a request even if it fails so that the processor is in
-    # a known state for the next call.
-    _ = sleep(state.i2c, state.address)
-
-    rc
+      response ->
+        {:ok, {response, state.cache}}
+    end
   end
 
   defp extract_payload(payload_length, payload_and_crc) do
@@ -164,7 +204,7 @@ defmodule ATECC508A.Transport.I2CServer do
     end
   end
 
-  defp wakeup(i2c, address, retries \\ 1)
+  defp wakeup(i2c, address, retries \\ @atecc508a_default_wakeup_retries)
 
   defp wakeup(_i2c, _address, 0) do
     {:error, :unexpected_wakeup_response}
@@ -188,10 +228,12 @@ defmodule ATECC508A.Transport.I2CServer do
         :ok
 
       {:ok, something_else} ->
+        Logger.warn(
+          "Unexpected wakeup response: #{inspect(something_else)}. #{retries - 1} retries remaining."
+        )
+
+        Process.sleep(@atecc508a_retry_wakeup_ms)
         _ = sleep(i2c, address)
-
-        Logger.warn("Unexpected wakeup response: #{inspect(something_else)}. Retrying.")
-
         wakeup(i2c, address, retries - 1)
 
       error ->

@@ -63,6 +63,11 @@ defmodule ATECC508A.Transport.I2C do
     to: ATECC508A.Transport.I2CServer
 
   @impl Transport
+  @spec request_all(instance(), [{binary(), non_neg_integer(), non_neg_integer()}]) ::
+          {:ok, {[{:ok, binary()}], [{:error, atom()}]}} | {:error, atom()}
+  defdelegate request_all(instance, requests), to: ATECC508A.Transport.I2CServer
+
+  @impl Transport
   @spec info(instance()) :: map()
   defdelegate info(instance), to: ATECC508A.Transport.I2CServer
 
